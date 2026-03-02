@@ -20,6 +20,9 @@ const createBooking = async (req, res) => {
       extra_beds = 0,
       payment_method = "pay_later",
       payment_percentage,
+      custom_total_amount,
+      booked_via_app = false,
+      app_name = null,
     } = req.body;
 
     // ── 1. Required field validation ────────────────────────────────────────
@@ -63,23 +66,43 @@ const createBooking = async (req, res) => {
 
     const baseTotal   = nights * pricePerNight;
     const extraTotal  = extraBedsCount * extraBedPrice * nights;
-    const totalAmount = baseTotal + extraTotal;
+    const calculatedTotal = baseTotal + extraTotal;
+
+    // Use custom amount if provided (booked via external app with negotiated price)
+    const customAmt = custom_total_amount !== undefined && custom_total_amount !== null
+      ? parseFloat(custom_total_amount)
+      : null;
+    const totalAmount = (customAmt !== null && !isNaN(customAmt) && customAmt > 0)
+      ? customAmt
+      : calculatedTotal;
 
     // ── 5. Insert booking ───────────────────────────────────────────────────
-    const { data: booking, error: bookingError } = await supabase
+    const bookingRow = {
+      room_id,
+      customer_id,
+      check_in,
+      check_out,
+      extra_beds: extraBedsCount,
+      total_amount: totalAmount,
+      booking_status: "confirmed",
+      created_by: req.user.id,
+      booked_via_app: Boolean(booked_via_app),
+      app_name: booked_via_app && app_name ? String(app_name).trim() : null,
+    };
+
+    let { data: booking, error: bookingError } = await supabase
       .from("bookings")
-      .insert([{
-        room_id,
-        customer_id,
-        check_in,
-        check_out,
-        extra_beds: extraBedsCount,
-        total_amount: totalAmount,
-        booking_status: "confirmed",
-        created_by: req.user.id,
-      }])
+      .insert([bookingRow])
       .select()
       .single();
+
+    // Graceful fallback: if new columns don't exist in DB yet, retry without them
+    if (bookingError && bookingError.message && bookingError.message.includes("column")) {
+      const { booked_via_app: _bva, app_name: _an, ...coreRow } = bookingRow;
+      const fallback = await supabase.from("bookings").insert([coreRow]).select().single();
+      booking      = fallback.data;
+      bookingError = fallback.error;
+    }
 
     if (bookingError) {
       // Surface DB-level double-booking trigger errors as clean 400
@@ -132,6 +155,7 @@ const createBooking = async (req, res) => {
         check_out,
         total_amount: totalAmount,
         payment_status: paymentStatus,
+        ...(booked_via_app && { booked_via_app: true, app_name }),
       },
     });
 

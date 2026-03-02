@@ -89,9 +89,12 @@ export default function BookingsPage() {
   const [createErr,      setCreateErr]      = useState("");
 
   // ── Step 3 state ──────────────────────────────────────────────────────
-  const [submitErr,    setSubmitErr] = useState("");
-  const [submitted,    setSubmitted] = useState(false);
+  const [submitErr,       setSubmitErr]       = useState("");
+  const [submitted,       setSubmitted]       = useState(false);
   const submittingRef = useRef(false);   // prevents double-submission
+  const [bookedViaApp,    setBookedViaApp]    = useState<boolean | null>(null);
+  const [appName,         setAppName]         = useState("");
+  const [customAmountRaw, setCustomAmountRaw] = useState("");
 
   // ══ Step 1 handlers ══════════════════════════════════════════════════════
 
@@ -199,6 +202,11 @@ export default function BookingsPage() {
     setSubmitErr("");
 
     try {
+      // Resolve final amount: use custom if provided & valid, else room estimate
+      const customAmt = bookedViaApp !== null && customAmountRaw !== ""
+        ? parseFloat(customAmountRaw)
+        : NaN;
+
       const body: Record<string, unknown> = {
         room_id:        selectedRoom!.room_id,
         customer_id:    selectedCustomer!.id,
@@ -206,6 +214,9 @@ export default function BookingsPage() {
         check_out:      searchParams.check_out,
         extra_beds:     searchParams.extra_beds,
         payment_method: paymentMethod,
+        booked_via_app: bookedViaApp ?? false,
+        ...(bookedViaApp && appName.trim() && { app_name: appName.trim() }),
+        ...(!isNaN(customAmt) && customAmt > 0 && { custom_total_amount: customAmt }),
       };
       if (paymentPct !== "" && paymentMethod !== "pay_later") {
         const pct = parseFloat(paymentPct);
@@ -530,12 +541,72 @@ export default function BookingsPage() {
               <SummaryRow label="Extra Beds" value={String(searchParams.extra_beds)} />
             )}
             <SummaryRow label="Customer"  value={`${selectedCustomer!.full_name} · ${selectedCustomer!.phone}`} />
+
+            {/* Booked via app? */}
+            <div className="flex items-center justify-between py-0.5">
+              <span className="text-gray-500">Booked via app?</span>
+              <div className="flex gap-2">
+                {([true, false] as const).map((val) => (
+                  <button
+                    key={String(val)}
+                    type="button"
+                    onClick={() => {
+                      setBookedViaApp(val);
+                      if (!val) { setAppName(""); setCustomAmountRaw(""); }
+                    }}
+                    className={`rounded-md px-3 py-1 text-xs font-semibold transition-colors ${
+                      bookedViaApp === val
+                        ? val ? "bg-blue-600 text-white" : "bg-gray-600 text-white"
+                        : "border border-gray-200 text-gray-500 hover:border-blue-300 hover:text-blue-600"
+                    }`}
+                  >
+                    {val ? "Yes" : "No"}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* App name input — only when Yes */}
+            {bookedViaApp === true && (
+              <div className="flex items-center justify-between gap-4 py-0.5">
+                <span className="shrink-0 text-gray-500">App Name</span>
+                <input
+                  type="text"
+                  placeholder="e.g. MakeMyTrip, Booking.com…"
+                  value={appName}
+                  onChange={(e) => setAppName(e.target.value)}
+                  className="w-56 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-900 placeholder:text-gray-400 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                />
+              </div>
+            )}
+
             <div className="border-t border-gray-200 pt-2">
-              <SummaryRow
-                label="Total Amount"
-                value={inr(selectedRoom!.total_estimated_price)}
-                bold
-              />
+              {bookedViaApp !== null ? (
+                /* Editable total amount — available for both Yes and No */
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-gray-900">Total Amount</span>
+                  <div className="flex items-center gap-1">
+                    <span className="text-sm text-gray-500">₹</span>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      placeholder={String(selectedRoom!.total_estimated_price)}
+                      value={customAmountRaw}
+                      onChange={(e) => {
+                        const raw = e.target.value.replace(/[^0-9.]/g, "");
+                        setCustomAmountRaw(raw);
+                      }}
+                      className="w-36 rounded-lg border border-blue-300 bg-white px-3 py-1.5 text-right text-sm font-bold text-gray-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200"
+                    />
+                  </div>
+                </div>
+              ) : (
+                <SummaryRow
+                  label="Total Amount"
+                  value={inr(selectedRoom!.total_estimated_price)}
+                  bold
+                />
+              )}
             </div>
           </div>
 
@@ -568,7 +639,7 @@ export default function BookingsPage() {
           {/* Partial payment percentage — only for non-pay_later */}
           {paymentMethod !== "pay_later" && (
             <div className="mt-4">
-              <FormField label="Payment Percentage (leave blank for full payment)">
+              <FormField label="Advance payment Percentage (leave blank for full payment)">
                 <div className="flex items-center gap-2">
                   <input
                     type="number"
@@ -579,11 +650,15 @@ export default function BookingsPage() {
                     className={`${inputCls} w-40`}
                   />
                   <span className="text-sm text-gray-500">%</span>
-                  {paymentPct !== "" && !isNaN(parseFloat(paymentPct)) && parseFloat(paymentPct) > 0 && parseFloat(paymentPct) < 100 && (
-                    <span className="text-sm font-medium text-blue-600">
-                      = {inr(Math.round(selectedRoom!.total_estimated_price * parseFloat(paymentPct) / 100))} now
-                    </span>
-                  )}
+                  {paymentPct !== "" && !isNaN(parseFloat(paymentPct)) && parseFloat(paymentPct) > 0 && parseFloat(paymentPct) < 100 && (() => {
+                    const customAmt = bookedViaApp !== null && customAmountRaw !== "" ? parseFloat(customAmountRaw) : NaN;
+                    const base = !isNaN(customAmt) && customAmt > 0 ? customAmt : selectedRoom!.total_estimated_price;
+                    return (
+                      <span className="text-sm font-medium text-blue-600">
+                        = {inr(Math.round(base * parseFloat(paymentPct) / 100))} now
+                      </span>
+                    );
+                  })()}
                 </div>
               </FormField>
             </div>
@@ -594,7 +669,7 @@ export default function BookingsPage() {
           {/* Action buttons */}
           <div className="mt-6 flex gap-3">
             <button
-              onClick={() => { setStep(2); setSubmitErr(""); }}
+              onClick={() => { setStep(2); setSubmitErr(""); setBookedViaApp(null); setAppName(""); setCustomAmountRaw(""); }}
               className="flex-1 rounded-lg border border-gray-200 py-2.5 text-sm font-medium text-gray-600 hover:bg-gray-50"
             >
               ← Back
