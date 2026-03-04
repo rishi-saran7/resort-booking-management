@@ -1,5 +1,6 @@
 const supabase = require("../config/supabaseClient");
 const { logAudit } = require("../utils/auditLogger");
+const { applyDiscountAndBreakdown } = require("../utils/gstCalculator");
 
 // ─── Helper: calculate nights between two date strings ────────────────────────
 
@@ -23,6 +24,8 @@ const createBooking = async (req, res) => {
       custom_total_amount,
       booked_via_app = false,
       app_name = null,
+      discount_type  = null,   // "flat" | "percentage" | null
+      discount_value = 0,      // ₹ amount or % value
     } = req.body;
 
     // ── 1. Required field validation ────────────────────────────────────────
@@ -59,35 +62,58 @@ const createBooking = async (req, res) => {
       return res.status(400).json({ success: false, data: null, error: "Room is not available (inactive)." });
     }
 
-    // ── 4. Calculate total amount ───────────────────────────────────────────
-    const pricePerNight = parseFloat(room.price_per_night);
-    const extraBedPrice = parseFloat(room.extra_bed_price || 0);
+    // ── 4. Calculate GST-inclusive total (room price already includes GST) ──
+    const pricePerNight  = parseFloat(room.price_per_night);   // GST-inclusive
+    const extraBedPrice  = parseFloat(room.extra_bed_price || 0); // GST-inclusive
     const extraBedsCount = parseInt(extra_beds, 10);
 
-    const baseTotal   = nights * pricePerNight;
-    const extraTotal  = extraBedsCount * extraBedPrice * nights;
-    const calculatedTotal = baseTotal + extraTotal;
-
-    // Use custom amount if provided (booked via external app with negotiated price)
+    // Use custom amount if provided (external app / negotiated price)
     const customAmt = custom_total_amount !== undefined && custom_total_amount !== null
       ? parseFloat(custom_total_amount)
       : null;
-    const totalAmount = (customAmt !== null && !isNaN(customAmt) && customAmt > 0)
-      ? customAmt
-      : calculatedTotal;
 
-    // ── 5. Insert booking ───────────────────────────────────────────────────
+    const baseCalculatedTotal =
+      (customAmt !== null && !isNaN(customAmt) && customAmt > 0)
+        ? customAmt
+        : (nights * pricePerNight) + (extraBedsCount * extraBedPrice * nights);
+
+    // ── 5. Apply discount and compute full pricing breakdown ─────────────────
+    let pricing;
+    try {
+      pricing = applyDiscountAndBreakdown(
+        baseCalculatedTotal,
+        discount_type  || null,
+        discount_value || 0
+      );
+    } catch (discountErr) {
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: discountErr.message,
+      });
+    }
+
+    const totalAmount = pricing.finalAmount; // GST-inclusive, post-discount
+
+    // ── 6. Insert booking ───────────────────────────────────────────────────
     const bookingRow = {
       room_id,
       customer_id,
       check_in,
       check_out,
-      extra_beds: extraBedsCount,
-      total_amount: totalAmount,
+      extra_beds:     extraBedsCount,
+      total_amount:   totalAmount,
       booking_status: "confirmed",
-      created_by: req.user.id,
+      created_by:     req.user.id,
       booked_via_app: Boolean(booked_via_app),
-      app_name: booked_via_app && app_name ? String(app_name).trim() : null,
+      app_name:       booked_via_app && app_name ? String(app_name).trim() : null,
+      // GST + discount snapshot columns (add these to your DB migration)
+      discount_type:        pricing.discountType,
+      discount_amount:      pricing.discountAmount,
+      base_price:           pricing.basePrice,
+      cgst_amount:          pricing.cgst,
+      sgst_amount:          pricing.sgst,
+      total_gst_amount:     pricing.totalGst,
     };
 
     let { data: booking, error: bookingError } = await supabase
@@ -96,20 +122,25 @@ const createBooking = async (req, res) => {
       .select()
       .single();
 
-    // Graceful fallback: if new columns don't exist in DB yet, retry without them
+    // Graceful fallback: if new columns don't exist in DB yet, retry with core fields only
     if (bookingError && bookingError.message && bookingError.message.includes("column")) {
-      const { booked_via_app: _bva, app_name: _an, ...coreRow } = bookingRow;
+      const {
+        booked_via_app: _bva, app_name: _an,
+        discount_type: _dt, discount_amount: _da,
+        base_price: _bp, cgst_amount: _ca,
+        sgst_amount: _sa, total_gst_amount: _tga,
+        ...coreRow
+      } = bookingRow;
       const fallback = await supabase.from("bookings").insert([coreRow]).select().single();
       booking      = fallback.data;
       bookingError = fallback.error;
     }
 
     if (bookingError) {
-      // Surface DB-level double-booking trigger errors as clean 400
       return res.status(400).json({ success: false, data: null, error: bookingError.message });
     }
 
-    // ── 6. Determine payment record ─────────────────────────────────────────
+    // ── 7. Determine payment record ─────────────────────────────────────────
     let paymentStatus;
     let amountPaid;
 
@@ -125,11 +156,13 @@ const createBooking = async (req, res) => {
     }
 
     const paymentPayload = {
-      booking_id:         booking.id,
+      booking_id:     booking.id,
       payment_method,
-      payment_status:     paymentStatus,
-      amount_paid:        amountPaid,
-      ...(payment_percentage !== undefined && { payment_percentage: parseFloat(payment_percentage) }),
+      payment_status: paymentStatus,
+      amount_paid:    amountPaid,
+      ...(payment_percentage !== undefined && {
+        payment_percentage: parseFloat(payment_percentage),
+      }),
     };
 
     const { data: payment, error: paymentError } = await supabase
@@ -153,15 +186,19 @@ const createBooking = async (req, res) => {
         customer_id,
         check_in,
         check_out,
-        total_amount: totalAmount,
-        payment_status: paymentStatus,
+        pricing_breakdown: pricing,
+        payment_status:    paymentStatus,
         ...(booked_via_app && { booked_via_app: true, app_name }),
       },
     });
 
     return res.status(201).json({
       success: true,
-      data: { booking, payment },
+      data: {
+        booking,
+        payment,
+        pricing_breakdown: pricing, // ← full breakdown returned to the client/UI
+      },
       error: null,
     });
   } catch (err) {
@@ -170,7 +207,7 @@ const createBooking = async (req, res) => {
 };
 
 // ─── GET /api/bookings ────────────────────────────────────────────────────────
-// Supports: ?status=confirmed  ?from=2026-01-01  ?to=2026-01-31
+// ...existing code...
 
 const getAllBookings = async (req, res) => {
   try {
@@ -181,13 +218,14 @@ const getAllBookings = async (req, res) => {
       .select(`
         id, room_id, customer_id, check_in, check_out, extra_beds,
         total_amount, booking_status, created_by, created_at,
+        discount_type, discount_amount, base_price,
+        cgst_amount, sgst_amount, total_gst_amount,
         rooms(room_number),
         customers(full_name, phone),
         payments(id, payment_status, amount_paid, payment_method)
       `)
       .order("created_at", { ascending: false });
 
-    // Filter by booking_status (indexed column)
     if (status) {
       const validStatuses = ["confirmed", "completed", "cancelled"];
       if (!validStatuses.includes(status)) {
@@ -200,12 +238,10 @@ const getAllBookings = async (req, res) => {
       query = query.eq("booking_status", status);
     }
 
-    // Filter created_at range
     if (from) {
       query = query.gte("created_at", new Date(from).toISOString());
     }
     if (to) {
-      // Include the entire end day
       const toDate = new Date(to);
       toDate.setUTCHours(23, 59, 59, 999);
       query = query.lte("created_at", toDate.toISOString());
@@ -250,6 +286,90 @@ const getBookingById = async (req, res) => {
   }
 };
 
+// ─── POST /api/bookings/pricing-preview ──────────────────────────────────────
+// Stateless endpoint — compute pricing breakdown WITHOUT creating a booking.
+// Useful for the UI to show live updates as the user changes discount values.
+
+const getPricingPreview = async (req, res) => {
+  try {
+    const {
+      room_id,
+      check_in,
+      check_out,
+      extra_beds = 0,
+      custom_total_amount,
+      discount_type  = null,
+      discount_value = 0,
+    } = req.body;
+
+    if (!room_id || !check_in || !check_out) {
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: "room_id, check_in, and check_out are required.",
+      });
+    }
+
+    const nights = calcNights(check_in, check_out);
+    if (nights <= 0) {
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: "check_out must be after check_in.",
+      });
+    }
+
+    const { data: room, error: roomError } = await supabase
+      .from("rooms")
+      .select("price_per_night, extra_bed_price")
+      .eq("id", room_id)
+      .single();
+
+    if (roomError || !room) {
+      return res.status(404).json({ success: false, data: null, error: "Room not found." });
+    }
+
+    const pricePerNight  = parseFloat(room.price_per_night);
+    const extraBedPrice  = parseFloat(room.extra_bed_price || 0);
+    const extraBedsCount = parseInt(extra_beds, 10);
+
+    const customAmt = custom_total_amount !== undefined && custom_total_amount !== null
+      ? parseFloat(custom_total_amount)
+      : null;
+
+    const baseCalculatedTotal =
+      (customAmt !== null && !isNaN(customAmt) && customAmt > 0)
+        ? customAmt
+        : (nights * pricePerNight) + (extraBedsCount * extraBedPrice * nights);
+
+    let pricing;
+    try {
+      pricing = applyDiscountAndBreakdown(
+        baseCalculatedTotal,
+        discount_type  || null,
+        discount_value || 0
+      );
+    } catch (discountErr) {
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: discountErr.message,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        nights,
+        ...pricing,
+      },
+      error: null,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, data: null, error: err.message });
+  }
+};
+
 // ─── PATCH /api/bookings/:id/status ─────────────────────────────────────────
 
 const VALID_STATUSES = ["confirmed", "completed", "cancelled"];
@@ -267,7 +387,6 @@ const updateBookingStatus = async (req, res) => {
       });
     }
 
-    // Fetch current booking to enforce guard rules
     const { data: existing, error: fetchError } = await supabase
       .from("bookings")
       .select("id, booking_status")
@@ -309,7 +428,6 @@ const checkoutBooking = async (req, res) => {
   try {
     const { id } = req.params;
 
-    // 1. Fetch booking with total_amount
     const { data: booking, error: fetchError } = await supabase
       .from("bookings")
       .select("id, booking_status, total_amount")
@@ -320,31 +438,18 @@ const checkoutBooking = async (req, res) => {
       return res.status(404).json({ success: false, data: null, error: "Booking not found." });
     }
 
-    // 2. Guard: cannot checkout completed or cancelled booking
     if (booking.booking_status === "completed") {
-      return res.status(400).json({
-        success: false,
-        data: null,
-        error: "Booking is already completed.",
-      });
+      return res.status(400).json({ success: false, data: null, error: "Booking is already completed." });
     }
     if (booking.booking_status === "cancelled") {
-      return res.status(400).json({
-        success: false,
-        data: null,
-        error: "Cannot checkout a cancelled booking.",
-      });
+      return res.status(400).json({ success: false, data: null, error: "Cannot checkout a cancelled booking." });
     }
 
     const now = new Date().toISOString();
 
-    // 3. Update booking → completed, set actual check_out time
     const { data: updatedBooking, error: updateError } = await supabase
       .from("bookings")
-      .update({
-        booking_status: "completed",
-        check_out: now,
-      })
+      .update({ booking_status: "completed", check_out: now })
       .eq("id", id)
       .select()
       .single();
@@ -353,7 +458,6 @@ const checkoutBooking = async (req, res) => {
       return res.status(500).json({ success: false, data: null, error: updateError.message });
     }
 
-    // 4. Check payment status — auto-settle if pending or partial
     const { data: payment, error: paymentFetchError } = await supabase
       .from("payments")
       .select("id, payment_status, amount_paid")
@@ -365,20 +469,14 @@ const checkoutBooking = async (req, res) => {
     if (!paymentFetchError && payment && payment.payment_status !== "paid") {
       const { data: settledPayment, error: paymentUpdateError } = await supabase
         .from("payments")
-        .update({
-          payment_status: "paid",
-          amount_paid: booking.total_amount,
-        })
+        .update({ payment_status: "paid", amount_paid: booking.total_amount })
         .eq("id", payment.id)
         .select()
         .single();
 
-      if (!paymentUpdateError) {
-        updatedPayment = settledPayment;
-      }
+      if (!paymentUpdateError) updatedPayment = settledPayment;
     }
 
-    // Fire-and-forget audit log
     logAudit({
       staff_id:    req.user.id,
       action:      "BOOKING_COMPLETED",
@@ -394,10 +492,7 @@ const checkoutBooking = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      data: {
-        booking: updatedBooking,
-        payment: updatedPayment,
-      },
+      data: { booking: updatedBooking, payment: updatedPayment },
       error: null,
     });
   } catch (err) {
@@ -411,7 +506,6 @@ const cancelBooking = async (req, res) => {
   try {
     const { id } = req.params;
 
-    // 1. Fetch current booking
     const { data: existing, error: fetchError } = await supabase
       .from("bookings")
       .select("id, booking_status")
@@ -422,24 +516,13 @@ const cancelBooking = async (req, res) => {
       return res.status(404).json({ success: false, data: null, error: "Booking not found." });
     }
 
-    // 2. Guard: cannot cancel a completed booking
     if (existing.booking_status === "completed") {
-      return res.status(400).json({
-        success: false,
-        data: null,
-        error: "Cannot cancel a completed booking.",
-      });
+      return res.status(400).json({ success: false, data: null, error: "Cannot cancel a completed booking." });
     }
-
     if (existing.booking_status === "cancelled") {
-      return res.status(400).json({
-        success: false,
-        data: null,
-        error: "Booking is already cancelled.",
-      });
+      return res.status(400).json({ success: false, data: null, error: "Booking is already cancelled." });
     }
 
-    // 3. Mark as cancelled
     const { data, error } = await supabase
       .from("bookings")
       .update({ booking_status: "cancelled" })
@@ -451,7 +534,6 @@ const cancelBooking = async (req, res) => {
       return res.status(500).json({ success: false, data: null, error: error.message });
     }
 
-    // Fire-and-forget audit log
     logAudit({
       staff_id:    req.user.id,
       action:      "BOOKING_CANCELLED",
@@ -470,6 +552,7 @@ module.exports = {
   createBooking,
   getAllBookings,
   getBookingById,
+  getPricingPreview,
   updateBookingStatus,
   checkoutBooking,
   cancelBooking,
