@@ -1,19 +1,19 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useRef, useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "../../lib/api";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface AvailableRoom {
-  room_id:              string;
-  room_number:          string;
-  room_type:            string;
-  capacity:             number;
-  price_per_night:      number;
-  extra_bed_price:      number;
-  nights:               number;
+  room_id:               string;
+  room_number:           string;
+  room_type:             string;
+  capacity:              number;
+  price_per_night:       number;
+  extra_bed_price:       number;
+  nights:                number;
   total_estimated_price: number;
 }
 
@@ -26,21 +26,36 @@ interface Customer {
 }
 
 interface SearchParams {
-  check_in:    string;
-  check_out:   string;
-  guests:      number;
-  extra_beds:  number;
+  check_in:   string;
+  check_out:  string;
+  guests:     number;
+  extra_beds: number;
 }
 
-type PaymentMethod = "cash" | "gpay" | "card" | "pay_later";
+interface PricingBreakdown {
+  nights:          number;
+  originalAmount:  number;
+  discountType:    "flat" | "percentage" | null;
+  discountValue:   number;
+  discountAmount:  number;
+  finalAmount:     number;   // GST-inclusive, post-discount
+  basePrice:       number;   // pre-GST base extracted from finalAmount
+  cgst:            number;
+  sgst:            number;
+  totalGst:        number;
+  gstRate:         string;
+  cgstRate:        string;
+  sgstRate:        string;
+}
+
+type PaymentMethod  = "cash" | "gpay" | "card" | "pay_later";
+type DiscountType   = "flat" | "percentage" | null;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function inr(n: number) {
-  return `₹${n.toLocaleString("en-IN")}`;
-}
+const inr = (n: number) =>
+  `₹${n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-/** Default check_in = today 12:00, check_out = tomorrow 12:00 */
 function defaultDates(): Pick<SearchParams, "check_in" | "check_out"> {
   const pad = (n: number) => String(n).padStart(2, "0");
   const fmt = (d: Date) =>
@@ -56,27 +71,26 @@ function defaultDates(): Pick<SearchParams, "check_in" | "check_out"> {
 export default function BookingsPage() {
   const router = useRouter();
 
-  // ── Wizard step ──────────────────────────────────────────────────────────
+  // ── Wizard step ───────────────────────────────────────────────────────
   const [step, setStep] = useState<1 | 2 | 3>(1);
 
-  // ── Shared booking state (accumulated across steps) ───────────────────
-  const [searchParams,    setSearchParams]    = useState<SearchParams>({
+  // ── Shared booking state ─────────────────────────────────────────────
+  const [searchParams,     setSearchParams]     = useState<SearchParams>({
     ...defaultDates(),
     guests:     1,
     extra_beds: 0,
   });
-  const [selectedRoom,    setSelectedRoom]    = useState<AvailableRoom | null>(null);
+  const [selectedRoom,     setSelectedRoom]     = useState<AvailableRoom | null>(null);
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
-  const [paymentMethod,   setPaymentMethod]   = useState<PaymentMethod>("cash");
-  const [paymentPct,      setPaymentPct]      = useState("");   // "" = full payment
+  const [paymentMethod,    setPaymentMethod]    = useState<PaymentMethod>("cash");
+  const [paymentPct,       setPaymentPct]       = useState("");
 
   // ── Step 1 state ──────────────────────────────────────────────────────
   const [availableRooms, setAvailableRooms] = useState<AvailableRoom[] | null>(null);
   const [searchLoading,  setSearchLoading]  = useState(false);
   const [searchError,    setSearchError]    = useState("");
-  // Raw string states so backspace/clear works in numeric inputs
-  const [guestsRaw,    setGuestsRaw]    = useState("1");
-  const [extraBedsRaw, setExtraBedsRaw] = useState("0");
+  const [guestsRaw,      setGuestsRaw]      = useState("1");
+  const [extraBedsRaw,   setExtraBedsRaw]   = useState("0");
 
   // ── Step 2 state ──────────────────────────────────────────────────────
   const [custSearchQ,    setCustSearchQ]    = useState("");
@@ -84,17 +98,104 @@ export default function BookingsPage() {
   const [custSearchLoad, setCustSearchLoad] = useState(false);
   const [custSearchErr,  setCustSearchErr]  = useState("");
   const [showCreate,     setShowCreate]     = useState(false);
-  const [newCust,        setNewCust]        = useState({ full_name: "", phone: "", aadhaar_number: "", email: "" });
-  const [createLoad,     setCreateLoad]     = useState(false);
-  const [createErr,      setCreateErr]      = useState("");
+  const [newCust,        setNewCust]        = useState({
+    full_name: "", phone: "", aadhaar_number: "", email: "",
+  });
+  const [createLoad, setCreateLoad] = useState(false);
+  const [createErr,  setCreateErr]  = useState("");
 
-  // ── Step 3 state ──────────────────────────────────────────────────────
+  // ── Step 3 — booking meta ─────────────────────────────────────────────
   const [submitErr,       setSubmitErr]       = useState("");
   const [submitted,       setSubmitted]       = useState(false);
-  const submittingRef = useRef(false);   // prevents double-submission
+  const submittingRef = useRef(false);
   const [bookedViaApp,    setBookedViaApp]    = useState<boolean | null>(null);
   const [appName,         setAppName]         = useState("");
   const [customAmountRaw, setCustomAmountRaw] = useState("");
+
+  // ── Step 3 — discount & live pricing ─────────────────────────────────
+  const [discountType,     setDiscountType]     = useState<DiscountType>(null);
+  const [discountValueRaw, setDiscountValueRaw] = useState("");
+  const [pricing,          setPricing]          = useState<PricingBreakdown | null>(null);
+  const [pricingLoading,   setPricingLoading]   = useState(false);
+  const [pricingError,     setPricingError]     = useState("");
+  const pricingDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ─── Live pricing preview — debounced ────────────────────────────────
+  const fetchPricingPreview = useCallback(async (
+    room:         AvailableRoom,
+    params:       SearchParams,
+    customAmt:    string,
+    dType:        DiscountType,
+    dValueRaw:    string,
+  ) => {
+    setPricingLoading(true);
+    setPricingError("");
+
+    const dValue = parseFloat(dValueRaw);
+
+    try {
+      const body: Record<string, unknown> = {
+        room_id:    room.room_id,
+        check_in:   params.check_in,
+        check_out:  params.check_out,
+        extra_beds: params.extra_beds,
+        ...(customAmt !== "" && !isNaN(parseFloat(customAmt)) && parseFloat(customAmt) > 0
+          && { custom_total_amount: parseFloat(customAmt) }),
+        ...(dType && !isNaN(dValue) && dValue > 0 && {
+          discount_type:  dType,
+          discount_value: dValue,
+        }),
+      };
+
+      const res = await api.post<PricingBreakdown>("/api/bookings/pricing-preview", body);
+      if (res.success) {
+        setPricing(res.data);
+        setPricingError("");
+      } else {
+        setPricingError(res.error ?? "Could not compute pricing.");
+        setPricing(null);
+      }
+    } catch {
+      setPricingError("Unable to reach the server.");
+      setPricing(null);
+    } finally {
+      setPricingLoading(false);
+    }
+  }, []);
+
+  // Trigger preview whenever discount / custom amount changes (debounced 500 ms)
+  useEffect(() => {
+    if (step !== 3 || !selectedRoom) return;
+
+    if (pricingDebounceRef.current) clearTimeout(pricingDebounceRef.current);
+
+    pricingDebounceRef.current = setTimeout(() => {
+      fetchPricingPreview(
+        selectedRoom,
+        searchParams,
+        customAmountRaw,
+        discountType,
+        discountValueRaw,
+      );
+    }, 500);
+
+    return () => {
+      if (pricingDebounceRef.current) clearTimeout(pricingDebounceRef.current);
+    };
+  }, [
+    step, selectedRoom, searchParams,
+    customAmountRaw, discountType, discountValueRaw,
+    fetchPricingPreview,
+  ]);
+
+  // Reset pricing state when entering step 3
+  function enterStep3() {
+    setPricing(null);
+    setPricingError("");
+    setDiscountType(null);
+    setDiscountValueRaw("");
+    setStep(3);
+  }
 
   // ══ Step 1 handlers ══════════════════════════════════════════════════════
 
@@ -103,14 +204,8 @@ export default function BookingsPage() {
     setSearchError("");
     setAvailableRooms(null);
 
-    if (searchParams.guests <= 0) {
-      setSearchError("Guests must be at least 1.");
-      return;
-    }
-    if (searchParams.extra_beds < 0) {
-      setSearchError("Extra beds cannot be negative.");
-      return;
-    }
+    if (searchParams.guests <= 0) { setSearchError("Guests must be at least 1."); return; }
+    if (searchParams.extra_beds < 0) { setSearchError("Extra beds cannot be negative."); return; }
     if (new Date(searchParams.check_out) <= new Date(searchParams.check_in)) {
       setSearchError("Check-out must be after check-in.");
       return;
@@ -153,7 +248,7 @@ export default function BookingsPage() {
       const res = await api.get<Customer[]>(`/api/customers?search=${encodeURIComponent(custSearchQ)}`);
       if (res.success) {
         setCustResults(res.data);
-        if (res.data.length === 0) setCustSearchErr("No customers found. You can create one below.");
+        if (res.data.length === 0) setCustSearchErr("No customers found. Create one below.");
       } else {
         setCustSearchErr(res.error ?? "Search failed.");
       }
@@ -183,7 +278,7 @@ export default function BookingsPage() {
       const res = await api.post<Customer>("/api/customers", payload);
       if (res.success) {
         setSelectedCustomer(res.data);
-        setStep(3);
+        enterStep3();
       } else {
         setCreateErr(res.error ?? "Failed to create customer.");
       }
@@ -197,15 +292,17 @@ export default function BookingsPage() {
   // ══ Step 3 handler ═══════════════════════════════════════════════════════
 
   async function handleConfirmBooking() {
-    if (submittingRef.current) return;   // block double-click
+    if (submittingRef.current) return;
     submittingRef.current = true;
     setSubmitErr("");
 
     try {
-      // Resolve final amount: use custom if provided & valid, else room estimate
-      const customAmt = bookedViaApp !== null && customAmountRaw !== ""
-        ? parseFloat(customAmountRaw)
-        : NaN;
+      const customAmt =
+        bookedViaApp !== null && customAmountRaw !== ""
+          ? parseFloat(customAmountRaw)
+          : NaN;
+
+      const dValue = parseFloat(discountValueRaw);
 
       const body: Record<string, unknown> = {
         room_id:        selectedRoom!.room_id,
@@ -217,7 +314,13 @@ export default function BookingsPage() {
         booked_via_app: bookedViaApp ?? false,
         ...(bookedViaApp && appName.trim() && { app_name: appName.trim() }),
         ...(!isNaN(customAmt) && customAmt > 0 && { custom_total_amount: customAmt }),
+        // ── Discount ──────────────────────────────────────────────────────
+        ...(discountType && !isNaN(dValue) && dValue > 0 && {
+          discount_type:  discountType,
+          discount_value: dValue,
+        }),
       };
+
       if (paymentPct !== "" && paymentMethod !== "pay_later") {
         const pct = parseFloat(paymentPct);
         if (!isNaN(pct) && pct > 0 && pct < 100) {
@@ -228,7 +331,7 @@ export default function BookingsPage() {
       const res = await api.post<unknown>("/api/bookings", body);
       if (res.success) {
         setSubmitted(true);
-        router.refresh(); // bust Next.js cache so dashboard re-fetches fresh stats
+        router.refresh();
         setTimeout(() => router.push("/dashboard"), 1800);
       } else {
         setSubmitErr(res.error ?? "Booking failed. Please try again.");
@@ -239,6 +342,13 @@ export default function BookingsPage() {
       submittingRef.current = false;
     }
   }
+
+  // ─── Derived: effective total for payment calc ────────────────────────────
+  const effectiveTotal =
+    pricing?.finalAmount ??
+    (customAmountRaw !== "" && !isNaN(parseFloat(customAmountRaw))
+      ? parseFloat(customAmountRaw)
+      : selectedRoom?.total_estimated_price ?? 0);
 
   // ══ Render ════════════════════════════════════════════════════════════════
 
@@ -262,10 +372,9 @@ export default function BookingsPage() {
         </p>
       </div>
 
-      {/* Step indicator */}
       <StepIndicator current={step} />
 
-      {/* ── Step 1 ─────────────────────────────────────────────────────── */}
+      {/* ── Step 1: Room Availability ──────────────────────────────────────── */}
       {step === 1 && (
         <Card>
           <SectionTitle>Search Room Availability</SectionTitle>
@@ -337,7 +446,6 @@ export default function BookingsPage() {
             </button>
           </form>
 
-          {/* Results */}
           {availableRooms !== null && (
             <div className="mt-6">
               <h3 className="mb-3 text-xs font-semibold uppercase tracking-widest text-gray-400">
@@ -367,9 +475,12 @@ export default function BookingsPage() {
                       </p>
                     </div>
                     <div className="mt-3 flex items-center justify-between">
-                      <span className="text-base font-bold text-blue-700">
-                        {inr(room.total_estimated_price)}
-                      </span>
+                      <div>
+                        <span className="text-base font-bold text-blue-700">
+                          {inr(room.total_estimated_price)}
+                        </span>
+                        <p className="text-[10px] text-gray-400">incl. 5% GST</p>
+                      </div>
                       <button
                         onClick={() => selectRoom(room)}
                         className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700"
@@ -385,14 +496,14 @@ export default function BookingsPage() {
         </Card>
       )}
 
-      {/* ── Step 2 ─────────────────────────────────────────────────────── */}
+      {/* ── Step 2: Customer ───────────────────────────────────────────────── */}
       {step === 2 && (
         <Card>
-          {/* Selected room summary strip */}
+          {/* Selected room strip */}
           <div className="mb-5 flex items-center justify-between rounded-lg bg-blue-50 px-4 py-3 text-sm">
             <span className="text-blue-700">
-              <strong>Room {selectedRoom!.room_number}</strong> · {selectedRoom!.nights} nights ·{" "}
-              {inr(selectedRoom!.total_estimated_price)}
+              <strong>Room {selectedRoom!.room_number}</strong> · {selectedRoom!.nights} night
+              {selectedRoom!.nights !== 1 ? "s" : ""} · {inr(selectedRoom!.total_estimated_price)}
             </span>
             <button
               onClick={() => { setStep(1); setSelectedRoom(null); }}
@@ -404,7 +515,6 @@ export default function BookingsPage() {
 
           <SectionTitle>Customer Details</SectionTitle>
 
-          {/* Search existing */}
           {!showCreate && (
             <>
               <form onSubmit={handleCustSearch} className="flex gap-2">
@@ -426,18 +536,19 @@ export default function BookingsPage() {
 
               {custSearchErr && <p className="mt-2 text-sm text-gray-500">{custSearchErr}</p>}
 
-              {/* Search results */}
               {custResults.length > 0 && (
                 <ul className="mt-3 divide-y divide-gray-100 overflow-hidden rounded-lg border border-gray-100">
                   {custResults.map((c) => (
                     <li
                       key={c.id}
-                      onClick={() => { setSelectedCustomer(c); setStep(3); }}
+                      onClick={() => { setSelectedCustomer(c); enterStep3(); }}
                       className="flex cursor-pointer items-center justify-between px-4 py-3 hover:bg-blue-50"
                     >
                       <div>
                         <p className="text-sm font-medium text-gray-800">{c.full_name}</p>
-                        <p className="text-xs text-gray-500">{c.phone}{c.email ? ` · ${c.email}` : ""}</p>
+                        <p className="text-xs text-gray-500">
+                          {c.phone}{c.email ? ` · ${c.email}` : ""}
+                        </p>
                       </div>
                       <span className="text-xs text-blue-600">Select →</span>
                     </li>
@@ -460,7 +571,6 @@ export default function BookingsPage() {
             </>
           )}
 
-          {/* Create new customer form */}
           {showCreate && (
             <form onSubmit={handleCreateCustomer} className="space-y-4">
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -525,67 +635,86 @@ export default function BookingsPage() {
         </Card>
       )}
 
-      {/* ── Step 3 ─────────────────────────────────────────────────────── */}
+      {/* ── Step 3: Confirm ────────────────────────────────────────────────── */}
       {step === 3 && (
-        <Card>
-          <SectionTitle>Confirm Booking</SectionTitle>
+        <div className="space-y-4">
 
-          {/* Summary */}
-          <div className="mb-5 space-y-2 rounded-xl bg-gray-50 p-4 text-sm">
-            <SummaryRow label="Room"     value={`#${selectedRoom!.room_number} · ${selectedRoom!.room_type}`} />
-            <SummaryRow label="Check-in"  value={new Date(searchParams.check_in).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })} />
-            <SummaryRow label="Check-out" value={new Date(searchParams.check_out).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })} />
-            <SummaryRow label="Nights"    value={String(selectedRoom!.nights)} />
-            <SummaryRow label="Guests"    value={String(searchParams.guests)} />
-            {searchParams.extra_beds > 0 && (
-              <SummaryRow label="Extra Beds" value={String(searchParams.extra_beds)} />
-            )}
-            <SummaryRow label="Customer"  value={`${selectedCustomer!.full_name} · ${selectedCustomer!.phone}`} />
-
-            {/* Booked via app? */}
-            <div className="flex items-center justify-between py-0.5">
-              <span className="text-gray-500">Booked via app?</span>
-              <div className="flex gap-2">
-                {([true, false] as const).map((val) => (
-                  <button
-                    key={String(val)}
-                    type="button"
-                    onClick={() => {
-                      setBookedViaApp(val);
-                      if (!val) { setAppName(""); setCustomAmountRaw(""); }
-                    }}
-                    className={`rounded-md px-3 py-1 text-xs font-semibold transition-colors ${
-                      bookedViaApp === val
-                        ? val ? "bg-blue-600 text-white" : "bg-gray-600 text-white"
-                        : "border border-gray-200 text-gray-500 hover:border-blue-300 hover:text-blue-600"
-                    }`}
-                  >
-                    {val ? "Yes" : "No"}
-                  </button>
-                ))}
-              </div>
+          {/* ── Booking summary card ─────────────────────────────────────── */}
+          <Card>
+            <SectionTitle>Booking Summary</SectionTitle>
+            <div className="space-y-2 text-sm">
+              <SummaryRow label="Room"      value={`#${selectedRoom!.room_number} · ${selectedRoom!.room_type}`} />
+              <SummaryRow
+                label="Check-in"
+                value={new Date(searchParams.check_in).toLocaleString("en-IN", {
+                  dateStyle: "medium", timeStyle: "short",
+                })}
+              />
+              <SummaryRow
+                label="Check-out"
+                value={new Date(searchParams.check_out).toLocaleString("en-IN", {
+                  dateStyle: "medium", timeStyle: "short",
+                })}
+              />
+              <SummaryRow label="Nights"    value={String(selectedRoom!.nights)} />
+              <SummaryRow label="Guests"    value={String(searchParams.guests)} />
+              {searchParams.extra_beds > 0 && (
+                <SummaryRow label="Extra Beds" value={String(searchParams.extra_beds)} />
+              )}
+              <SummaryRow
+                label="Customer"
+                value={`${selectedCustomer!.full_name} · ${selectedCustomer!.phone}`}
+              />
             </div>
 
-            {/* App name input — only when Yes */}
-            {bookedViaApp === true && (
-              <div className="flex items-center justify-between gap-4 py-0.5">
-                <span className="shrink-0 text-gray-500">App Name</span>
-                <input
-                  type="text"
-                  placeholder="e.g. MakeMyTrip, Booking.com…"
-                  value={appName}
-                  onChange={(e) => setAppName(e.target.value)}
-                  className="w-56 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-900 placeholder:text-gray-400 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
-                />
+            {/* ── Booked via app toggle ───────────────────────────────────── */}
+            <div className="mt-4 border-t border-gray-100 pt-4">
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-gray-500">Booked via external app?</span>
+                <div className="flex gap-2">
+                  {([true, false] as const).map((val) => (
+                    <button
+                      key={String(val)}
+                      type="button"
+                      onClick={() => {
+                        setBookedViaApp(val);
+                        if (!val) { setAppName(""); setCustomAmountRaw(""); }
+                      }}
+                      className={`rounded-md px-3 py-1 text-xs font-semibold transition-colors ${
+                        bookedViaApp === val
+                          ? val
+                            ? "bg-blue-600 text-white"
+                            : "bg-gray-600 text-white"
+                          : "border border-gray-200 text-gray-500 hover:border-blue-300 hover:text-blue-600"
+                      }`}
+                    >
+                      {val ? "Yes" : "No"}
+                    </button>
+                  ))}
+                </div>
               </div>
-            )}
 
-            <div className="border-t border-gray-200 pt-2">
-              {bookedViaApp !== null ? (
-                /* Editable total amount — available for both Yes and No */
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold text-gray-900">Total Amount</span>
-                  <div className="flex items-center gap-1">
+              {bookedViaApp === true && (
+                <div className="mt-3 flex items-center justify-between gap-4">
+                  <span className="shrink-0 text-sm text-gray-500">App Name</span>
+                  <input
+                    type="text"
+                    placeholder="e.g. MakeMyTrip, Booking.com…"
+                    value={appName}
+                    onChange={(e) => setAppName(e.target.value)}
+                    className={`${inputCls} w-64`}
+                  />
+                </div>
+              )}
+
+              {/* Custom amount — available once Yes/No is chosen */}
+              {bookedViaApp !== null && (
+                <div className="mt-3 flex items-center justify-between gap-4">
+                  <span className="shrink-0 text-sm text-gray-500">
+                    Override Amount
+                    <span className="ml-1 text-xs text-gray-400">(optional)</span>
+                  </span>
+                  <div className="flex items-center gap-1.5">
                     <span className="text-sm text-gray-500">₹</span>
                     <input
                       type="text"
@@ -596,80 +725,108 @@ export default function BookingsPage() {
                         const raw = e.target.value.replace(/[^0-9.]/g, "");
                         setCustomAmountRaw(raw);
                       }}
-                      className="w-36 rounded-lg border border-blue-300 bg-white px-3 py-1.5 text-right text-sm font-bold text-gray-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200"
+                      className="w-36 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-right text-sm font-semibold text-gray-900 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
                     />
                   </div>
                 </div>
-              ) : (
-                <SummaryRow
-                  label="Total Amount"
-                  value={inr(selectedRoom!.total_estimated_price)}
-                  bold
-                />
               )}
             </div>
-          </div>
+          </Card>
 
-          {/* Payment method */}
-          <FormField label="Payment Method" required>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-              {(["cash", "gpay", "card", "pay_later"] as PaymentMethod[]).map((m) => (
-                <label
-                  key={m}
-                  className={`flex cursor-pointer items-center justify-center rounded-lg border px-3 py-2.5 text-sm font-medium transition-colors ${
-                    paymentMethod === m
-                      ? "border-blue-500 bg-blue-50 text-blue-700"
-                      : "border-gray-200 text-gray-600 hover:border-blue-200 hover:bg-blue-50/40"
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    name="payment_method"
-                    value={m}
-                    checked={paymentMethod === m}
-                    onChange={() => { setPaymentMethod(m); setPaymentPct(""); }}
-                    className="sr-only"
-                  />
-                  {m === "pay_later" ? "Pay Later" : m.charAt(0).toUpperCase() + m.slice(1)}
-                </label>
-              ))}
-            </div>
-          </FormField>
+          {/* ── Live Pricing Panel ───────────────────────────────────────── */}
+          <PricingPanel
+            room={selectedRoom!}
+            discountType={discountType}
+            discountValueRaw={discountValueRaw}
+            pricing={pricing}
+            loading={pricingLoading}
+            error={pricingError}
+            onDiscountTypeChange={(t) => {
+              setDiscountType(t);
+              setDiscountValueRaw("");
+            }}
+            onDiscountValueChange={setDiscountValueRaw}
+          />
 
-          {/* Partial payment percentage — only for non-pay_later */}
-          {paymentMethod !== "pay_later" && (
-            <div className="mt-4">
-              <FormField label="Advance payment Percentage (leave blank for full payment)">
-                <div className="flex items-center gap-2">
-                  <input
-                    type="number"
-                    min={1} max={99}
-                    placeholder="e.g. 50"
-                    value={paymentPct}
-                    onChange={(e) => setPaymentPct(e.target.value)}
-                    className={`${inputCls} w-40`}
-                  />
-                  <span className="text-sm text-gray-500">%</span>
-                  {paymentPct !== "" && !isNaN(parseFloat(paymentPct)) && parseFloat(paymentPct) > 0 && parseFloat(paymentPct) < 100 && (() => {
-                    const customAmt = bookedViaApp !== null && customAmountRaw !== "" ? parseFloat(customAmountRaw) : NaN;
-                    const base = !isNaN(customAmt) && customAmt > 0 ? customAmt : selectedRoom!.total_estimated_price;
-                    return (
-                      <span className="text-sm font-medium text-blue-600">
-                        = {inr(Math.round(base * parseFloat(paymentPct) / 100))} now
-                      </span>
-                    );
-                  })()}
-                </div>
-              </FormField>
-            </div>
-          )}
+          {/* ── Payment card ─────────────────────────────────────────────── */}
+          <Card>
+            <SectionTitle>Payment</SectionTitle>
 
-          {submitErr && <div className="mt-4"><ErrorMsg>{submitErr}</ErrorMsg></div>}
+            <FormField label="Payment Method" required>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                {(["cash", "gpay", "card", "pay_later"] as PaymentMethod[]).map((m) => (
+                  <label
+                    key={m}
+                    className={`flex cursor-pointer items-center justify-center rounded-lg border px-3 py-2.5 text-sm font-medium transition-colors ${
+                      paymentMethod === m
+                        ? "border-blue-500 bg-blue-50 text-blue-700"
+                        : "border-gray-200 text-gray-600 hover:border-blue-200 hover:bg-blue-50/40"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="payment_method"
+                      value={m}
+                      checked={paymentMethod === m}
+                      onChange={() => { setPaymentMethod(m); setPaymentPct(""); }}
+                      className="sr-only"
+                    />
+                    {m === "pay_later" ? "Pay Later" : m.charAt(0).toUpperCase() + m.slice(1)}
+                  </label>
+                ))}
+              </div>
+            </FormField>
+
+            {paymentMethod !== "pay_later" && (
+              <div className="mt-4">
+                <FormField label="Advance Percentage (leave blank = full payment)">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1} max={99}
+                      placeholder="e.g. 50"
+                      value={paymentPct}
+                      onChange={(e) => setPaymentPct(e.target.value)}
+                      className={`${inputCls} w-36`}
+                    />
+                    <span className="text-sm text-gray-500">%</span>
+                    {paymentPct !== "" &&
+                      !isNaN(parseFloat(paymentPct)) &&
+                      parseFloat(paymentPct) > 0 &&
+                      parseFloat(paymentPct) < 100 && (
+                        <span className="rounded-md bg-blue-50 px-2 py-1 text-sm font-semibold text-blue-700">
+                          = {inr(Math.round(effectiveTotal * parseFloat(paymentPct) / 100))} now
+                        </span>
+                    )}
+                  </div>
+                </FormField>
+              </div>
+            )}
+
+            {/* Pay Later notice */}
+            {paymentMethod === "pay_later" && (
+              <div className="mt-3 flex items-center gap-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                <span>⏳</span>
+                <span>Payment will be collected at check-out. Amount due: <strong>{inr(effectiveTotal)}</strong></span>
+              </div>
+            )}
+          </Card>
+
+          {submitErr && <ErrorMsg>{submitErr}</ErrorMsg>}
 
           {/* Action buttons */}
-          <div className="mt-6 flex gap-3">
+          <div className="flex gap-3 pb-6">
             <button
-              onClick={() => { setStep(2); setSubmitErr(""); setBookedViaApp(null); setAppName(""); setCustomAmountRaw(""); }}
+              onClick={() => {
+                setStep(2);
+                setSubmitErr("");
+                setBookedViaApp(null);
+                setAppName("");
+                setCustomAmountRaw("");
+                setDiscountType(null);
+                setDiscountValueRaw("");
+                setPricing(null);
+              }}
               className="flex-1 rounded-lg border border-gray-200 py-2.5 text-sm font-medium text-gray-600 hover:bg-gray-50"
             >
               ← Back
@@ -679,12 +836,215 @@ export default function BookingsPage() {
               disabled={submittingRef.current}
               className="flex-1 rounded-lg bg-green-600 py-2.5 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50"
             >
-              {submittingRef.current ? "Booking…" : "Confirm Booking"}
+              {submittingRef.current ? "Booking…" : "✓ Confirm Booking"}
             </button>
           </div>
-        </Card>
+        </div>
       )}
     </div>
+  );
+}
+
+// ─── PricingPanel ─────────────────────────────────────────────────────────────
+
+interface PricingPanelProps {
+  room:                  AvailableRoom;
+  discountType:          DiscountType;
+  discountValueRaw:      string;
+  pricing:               PricingBreakdown | null;
+  loading:               boolean;
+  error:                 string;
+  onDiscountTypeChange:  (t: DiscountType) => void;
+  onDiscountValueChange: (v: string) => void;
+}
+
+function PricingPanel({
+  room,
+  discountType,
+  discountValueRaw,
+  pricing,
+  loading,
+  error,
+  onDiscountTypeChange,
+  onDiscountValueChange,
+}: PricingPanelProps) {
+  const dValue    = parseFloat(discountValueRaw);
+  const hasDiscount =
+    discountType !== null && !isNaN(dValue) && dValue > 0;
+
+  // Fallback values when no pricing response yet
+  const original = pricing?.originalAmount ?? room.total_estimated_price;
+  const final    = pricing?.finalAmount    ?? room.total_estimated_price;
+
+  return (
+    <Card>
+      <SectionTitle>Pricing & GST Breakdown</SectionTitle>
+
+      {/* ── Discount controls ──────────────────────────────────────────── */}
+      <div className="mb-5 rounded-xl bg-gray-50 p-4">
+        <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400">
+          Apply Discount
+        </p>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+          {/* Discount type toggle */}
+          <div className="flex gap-2">
+            {([null, "flat", "percentage"] as DiscountType[]).map((t) => (
+              <button
+                key={String(t)}
+                type="button"
+                onClick={() => onDiscountTypeChange(t)}
+                className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
+                  discountType === t
+                    ? "bg-blue-600 text-white shadow-sm"
+                    : "border border-gray-200 bg-white text-gray-500 hover:border-blue-300 hover:text-blue-600"
+                }`}
+              >
+                {t === null ? "No Discount" : t === "flat" ? "₹ Flat" : "% Off"}
+              </button>
+            ))}
+          </div>
+
+          {/* Discount value input — only when type selected */}
+          {discountType !== null && (
+            <div className="flex items-center gap-2">
+              <div className="relative">
+                {discountType === "flat" && (
+                  <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-sm text-gray-400">
+                    ₹
+                  </span>
+                )}
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  placeholder={discountType === "flat" ? "500" : "10"}
+                  value={discountValueRaw}
+                  onChange={(e) => {
+                    const raw = e.target.value.replace(/[^0-9.]/g, "");
+                    onDiscountValueChange(raw);
+                  }}
+                  className={`${inputCls} w-36 ${discountType === "flat" ? "pl-7" : "pr-7"}`}
+                />
+                {discountType === "percentage" && (
+                  <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-sm text-gray-400">
+                    %
+                  </span>
+                )}
+              </div>
+
+              {/* Live discount preview badge */}
+              {hasDiscount && pricing && (
+                <span className="rounded-full bg-green-50 px-2.5 py-1 text-xs font-semibold text-green-700 ring-1 ring-green-200">
+                  −{inr(pricing.discountAmount)} off
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+
+        {error && (
+          <p className="mt-2 text-xs text-red-500">⚠ {error}</p>
+        )}
+      </div>
+
+      {/* ── Pricing breakdown table ────────────────────────────────────── */}
+      <div
+        className={`space-y-0 rounded-xl border border-gray-100 overflow-hidden text-sm transition-opacity ${
+          loading ? "opacity-50" : "opacity-100"
+        }`}
+      >
+        {/* Original price row */}
+        <div className="flex items-center justify-between bg-white px-4 py-3">
+          <span className="text-gray-500">
+            Room price × {room.nights} night{room.nights !== 1 ? "s" : ""}
+          </span>
+          <span className="font-medium text-gray-800">
+            {inr(original)}
+          </span>
+        </div>
+
+        {/* Discount row — only when active */}
+        {hasDiscount && pricing && (
+          <div className="flex items-center justify-between bg-green-50 px-4 py-3">
+            <span className="text-green-700">
+              Discount
+              {discountType === "flat"
+                ? ` (₹${dValue} off)`
+                : ` (${dValue}% off)`}
+            </span>
+            <span className="font-semibold text-green-700">
+              − {inr(pricing.discountAmount)}
+            </span>
+          </div>
+        )}
+
+        {/* Divider */}
+        <div className="border-t border-gray-100" />
+
+        {/* Final payable */}
+        <div className="flex items-center justify-between bg-blue-50 px-4 py-3.5">
+          <span className="font-semibold text-blue-800">
+            Total Payable
+            <span className="ml-1.5 text-xs font-normal text-blue-500">(incl. GST)</span>
+          </span>
+          <span className="text-lg font-bold text-blue-700">
+            {loading ? "…" : inr(final)}
+          </span>
+        </div>
+
+        {/* GST breakdown — always shown, updates on discount change */}
+        <div className="border-t border-gray-100 bg-gray-50 px-4 py-3">
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-gray-400">
+            GST Breakdown (extracted from total)
+          </p>
+          <div className="space-y-1.5">
+            <GstRow
+              label="Base Price (excl. GST)"
+              value={pricing ? inr(pricing.basePrice) : "—"}
+              loading={loading}
+            />
+            <GstRow
+              label={`CGST @ ${pricing?.cgstRate ?? "2.5%"}`}
+              value={pricing ? inr(pricing.cgst) : "—"}
+              loading={loading}
+            />
+            <GstRow
+              label={`SGST @ ${pricing?.sgstRate ?? "2.5%"}`}
+              value={pricing ? inr(pricing.sgst) : "—"}
+              loading={loading}
+            />
+            <div className="border-t border-gray-200 pt-1.5">
+              <GstRow
+                label={`Total GST @ ${pricing?.gstRate ?? "5%"}`}
+                value={pricing ? inr(pricing.totalGst) : "—"}
+                loading={loading}
+                bold
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Verification line */}
+        {pricing && (
+          <div className="flex items-center gap-1.5 border-t border-gray-100 bg-gray-50 px-4 py-2 text-xs text-gray-400">
+            <span className="text-green-500">✓</span>
+            Base {inr(pricing.basePrice)} + GST {inr(pricing.totalGst)} = {inr(pricing.finalAmount)}
+          </div>
+        )}
+      </div>
+
+      {/* Hint when no preview yet */}
+      {!pricing && !loading && !error && (
+        <p className="mt-3 text-center text-xs text-gray-400">
+          GST breakdown will appear here automatically
+        </p>
+      )}
+
+      {loading && (
+        <p className="mt-3 text-center text-xs text-blue-400 animate-pulse">
+          Calculating…
+        </p>
+      )}
+    </Card>
   );
 }
 
@@ -743,7 +1103,9 @@ function Card({ children }: { children: React.ReactNode }) {
 }
 
 function SectionTitle({ children }: { children: React.ReactNode }) {
-  return <h2 className="mb-4 text-sm font-semibold text-gray-800">{children}</h2>;
+  return (
+    <h2 className="mb-4 text-sm font-semibold text-gray-800">{children}</h2>
+  );
 }
 
 function FormField({
@@ -774,22 +1136,46 @@ function ErrorMsg({ children }: { children: React.ReactNode }) {
   );
 }
 
-function SummaryRow({
+function SummaryRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-start justify-between gap-4 py-0.5">
+      <span className="shrink-0 text-gray-500">{label}</span>
+      <span className="text-right text-gray-700">{value}</span>
+    </div>
+  );
+}
+
+function GstRow({
   label,
   value,
+  loading,
   bold,
 }: {
-  label: string;
-  value: string;
-  bold?: boolean;
+  label:    string;
+  value:    string;
+  loading:  boolean;
+  bold?:    boolean;
 }) {
   return (
     <div className="flex items-center justify-between">
-      <span className="text-gray-500">{label}</span>
-      <span className={bold ? "font-bold text-gray-900" : "text-gray-700"}>{value}</span>
+      <span className={`text-xs ${bold ? "font-semibold text-gray-700" : "text-gray-500"}`}>
+        {label}
+      </span>
+      <span
+        className={`text-xs ${
+          bold
+            ? "font-bold text-gray-800"
+            : loading
+            ? "text-gray-300"
+            : "text-gray-700"
+        }`}
+      >
+        {value}
+      </span>
     </div>
   );
 }
 
 const inputCls =
-  "rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 outline-none transition focus:border-blue-400 focus:ring-2 focus:ring-blue-200";
+  "rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 " +
+  "placeholder:text-gray-400 outline-none transition focus:border-blue-400 focus:ring-2 focus:ring-blue-200";
