@@ -4,6 +4,7 @@ const {
   createBooking,
   getAllBookings,
   getBookingById,
+  getPricingPreview,
   updateBookingStatus,
   checkoutBooking,
   cancelBooking,
@@ -14,6 +15,9 @@ const {
 // List & create
 router.get("/", getAllBookings);          // ?status= ?from= ?to=
 router.post("/", createBooking);
+
+// Pricing preview (stateless — no booking created)
+router.post("/pricing-preview", getPricingPreview);
 
 // Lifecycle — must be before /:id to avoid route shadowing
 router.patch("/:id/status",   updateBookingStatus);

@@ -10,6 +10,7 @@ const bookingRoutes   = require("./routes/bookingRoutes");
 const dashboardRoutes = require("./routes/dashboardRoutes");
 const paymentRoutes   = require("./routes/paymentRoutes");
 const auditLogRoutes  = require("./routes/auditLogRoutes");
+const invoiceRoutes   = require("./routes/invoiceRoutes");
 const { protect }     = require("./middleware/authMiddleware");
 
 const app = express();
@@ -36,6 +37,7 @@ app.use("/api/bookings",    protect, bookingRoutes);
 app.use("/api/dashboard",   protect, dashboardRoutes);
 app.use("/api/payments",    protect, paymentRoutes);
 app.use("/api/audit-logs",  protect, auditLogRoutes);
+app.use("/api/invoices",    protect, invoiceRoutes);
 
 // Start server
 app.listen(PORT, () => {

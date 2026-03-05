@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
+import { triggerInvoiceDownload } from "../../lib/invoiceDownload";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -146,12 +147,22 @@ export default function ManageBookingsPage() {
     if (checkingOutRef.current.has(booking.id)) return;
     checkingOutRef.current.add(booking.id);
     try {
-      const res = await api.patch<unknown>(`/api/bookings/${booking.id}/checkout`, {});
+      const res = await api.patch<{
+        booking:              unknown;
+        payment:              unknown;
+        invoice_available:    boolean;
+        invoice_download_url: string | null;
+      }>(`/api/bookings/${booking.id}/checkout`, {});
+
       if (res.success) {
+        // ── Auto-download invoice on checkout (payment always auto-settled) ─
+        if (res.data.invoice_available && res.data.invoice_download_url) {
+          await triggerInvoiceDownload(res.data.invoice_download_url, booking.id);
+        }
         setToast("Guest checked out successfully.");
         fetchBookings(false);
       } else {
-        setToast(""); // clear
+        setToast("");
         setError(res.error ?? "Checkout failed.");
       }
     } catch {
@@ -190,6 +201,7 @@ export default function ManageBookingsPage() {
     setPayErr("");
   }
 
+  // ── Update payment ────────────────────────────────────────────────────────
   async function handleUpdatePayment() {
     if (!payTarget) return;
     const pmt = payTarget.payments[0];
@@ -209,8 +221,22 @@ export default function ManageBookingsPage() {
     setPayLoading(true);
     setPayErr("");
     try {
-      const res = await api.patch<unknown>(`/api/payments/${pmt.id}`, { amount_paid: amount });
+      const res = await api.patch<{
+        id:                   string;
+        payment_status:       string;
+        amount_paid:          number;
+        invoice_available:    boolean;
+        invoice_download_url: string | null;
+      }>(`/api/payments/${pmt.id}`, { amount_paid: amount });
+
       if (res.success) {
+        // ── Auto-download invoice when payment becomes fully paid ─────────
+        if (res.data.invoice_available && res.data.invoice_download_url) {
+          await triggerInvoiceDownload(
+            res.data.invoice_download_url,
+            payTarget.id
+          );
+        }
         setPayTarget(null);
         setToast(`Payment updated — ${inr(amount)} recorded.`);
         fetchBookings(false);
