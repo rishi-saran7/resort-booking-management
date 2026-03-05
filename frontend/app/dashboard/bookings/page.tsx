@@ -3,6 +3,7 @@
 import { useRef, useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "../../lib/api";
+import { triggerInvoiceDownload } from "../../lib/invoiceDownload";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -314,7 +315,6 @@ export default function BookingsPage() {
         booked_via_app: bookedViaApp ?? false,
         ...(bookedViaApp && appName.trim() && { app_name: appName.trim() }),
         ...(!isNaN(customAmt) && customAmt > 0 && { custom_total_amount: customAmt }),
-        // ── Discount ──────────────────────────────────────────────────────
         ...(discountType && !isNaN(dValue) && dValue > 0 && {
           discount_type:  discountType,
           discount_value: dValue,
@@ -328,11 +328,26 @@ export default function BookingsPage() {
         }
       }
 
-      const res = await api.post<unknown>("/api/bookings", body);
+      // ── Updated type — now includes invoice fields from backend ──────────
+      const res = await api.post<{
+        booking:              { id: string };
+        payment:              { payment_status: string; amount_paid: number } | null;
+        pricing_breakdown:    unknown;
+        invoice_available:    boolean;
+        invoice_download_url: string | null;
+      }>("/api/bookings", body);
+
       if (res.success) {
+        const { booking, invoice_available, invoice_download_url } = res.data;
+
+        // ── Auto-download invoice ONLY when fully paid ────────────────────
+        if (invoice_available && invoice_download_url) {
+          await triggerInvoiceDownload(invoice_download_url, booking.id);
+        }
+
         setSubmitted(true);
         router.refresh();
-        setTimeout(() => router.push("/dashboard"), 1800);
+        setTimeout(() => router.push("/dashboard"), 2000);
       } else {
         setSubmitErr(res.error ?? "Booking failed. Please try again.");
         submittingRef.current = false;
