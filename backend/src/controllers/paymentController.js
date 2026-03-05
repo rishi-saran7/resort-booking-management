@@ -1,27 +1,27 @@
-const supabase = require("../config/supabaseClient");
+const supabase     = require("../config/supabaseClient");
 const { logAudit } = require("../utils/auditLogger");
 
 // ─── PATCH /api/payments/:id ──────────────────────────────────────────────────
 // Staff can manually update a payment record.
-// Body: { amount_paid: number, payment_status?: "paid|partial|pending" }
+// Body: { amount_paid: number }
 //
 // Rules:
 //  - amount_paid cannot exceed booking.total_amount
-//  - If amount_paid == total_amount → force payment_status = "paid"
-//  - If amount_paid < total_amount  → force payment_status = "partial"
+//  - If amount_paid >= total_amount → force payment_status = "paid"
+//  - If 0 < amount_paid < total_amount → force payment_status = "partial"
 //  - amount_paid = 0                → force payment_status = "pending"
 
 const updatePayment = async (req, res) => {
   try {
     const { id } = req.params;
-    const { amount_paid, payment_status } = req.body;
+    const { amount_paid } = req.body;
 
     // ── 1. Validate input ────────────────────────────────────────────────────
     if (amount_paid === undefined || amount_paid === null) {
       return res.status(400).json({
         success: false,
-        data: null,
-        error: "amount_paid is required.",
+        data:    null,
+        error:   "amount_paid is required.",
       });
     }
 
@@ -29,8 +29,8 @@ const updatePayment = async (req, res) => {
     if (isNaN(parsedAmount) || parsedAmount < 0) {
       return res.status(400).json({
         success: false,
-        data: null,
-        error: "amount_paid must be a non-negative number.",
+        data:    null,
+        error:   "amount_paid must be a non-negative number.",
       });
     }
 
@@ -42,7 +42,11 @@ const updatePayment = async (req, res) => {
       .single();
 
     if (paymentFetchError || !payment) {
-      return res.status(404).json({ success: false, data: null, error: "Payment not found." });
+      return res.status(404).json({
+        success: false,
+        data:    null,
+        error:   "Payment not found.",
+      });
     }
 
     const { data: booking, error: bookingFetchError } = await supabase
@@ -52,24 +56,29 @@ const updatePayment = async (req, res) => {
       .single();
 
     if (bookingFetchError || !booking) {
-      return res.status(404).json({ success: false, data: null, error: "Associated booking not found." });
+      return res.status(404).json({
+        success: false,
+        data:    null,
+        error:   "Associated booking not found.",
+      });
     }
 
-    // ── 3. Business rule: completed bookings allow payment adjustments,
-    //    but we still enforce the overpay guard ───────────────────────────────
+    // ── 3. Enforce overpay guard ─────────────────────────────────────────────
     const totalAmount = parseFloat(booking.total_amount);
 
     if (parsedAmount > totalAmount) {
       return res.status(400).json({
         success: false,
-        data: null,
-        error: `amount_paid (${parsedAmount}) cannot exceed booking total_amount (${totalAmount}).`,
+        data:    null,
+        error:   `amount_paid (${parsedAmount}) cannot exceed booking total_amount (${totalAmount}).`,
       });
     }
 
-    // ── 4. Auto-derive payment_status (override any client-supplied value) ───
+    // ── 4. Auto-derive payment_status ────────────────────────────────────────
+    // explicit client-supplied payment_status is intentionally ignored —
+    // status is always derived from the amount to stay consistent.
     let resolvedStatus;
-    if (parsedAmount === totalAmount) {
+    if (parsedAmount >= totalAmount) {
       resolvedStatus = "paid";
     } else if (parsedAmount > 0) {
       resolvedStatus = "partial";
@@ -77,15 +86,11 @@ const updatePayment = async (req, res) => {
       resolvedStatus = "pending";
     }
 
-    // Allow explicit override only when it doesn't contradict the amount rules
-    // (e.g. staff may want to mark pending despite partial — we auto-derive
-    //  above, so explicit payment_status is silently ignored to stay safe)
-
     // ── 5. Persist update ────────────────────────────────────────────────────
     const { data: updatedPayment, error: updateError } = await supabase
       .from("payments")
       .update({
-        amount_paid: parsedAmount,
+        amount_paid:    parsedAmount,
         payment_status: resolvedStatus,
       })
       .eq("id", id)
@@ -93,16 +98,20 @@ const updatePayment = async (req, res) => {
       .single();
 
     if (updateError) {
-      return res.status(500).json({ success: false, data: null, error: updateError.message });
+      return res.status(500).json({
+        success: false,
+        data:    null,
+        error:   updateError.message,
+      });
     }
 
-    // Fire-and-forget audit log
+    // ── 6. Fire-and-forget audit log ─────────────────────────────────────────
     logAudit({
       staff_id:    req.user.id,
       action:      "PAYMENT_UPDATED",
       entity_type: "payment",
       entity_id:   id,
-      metadata:    {
+      metadata: {
         booking_id:      payment.booking_id,
         previous_status: payment.payment_status,
         new_status:      resolvedStatus,
@@ -111,9 +120,26 @@ const updatePayment = async (req, res) => {
       },
     });
 
-    return res.status(200).json({ success: true, data: updatedPayment, error: null });
+    // ── 7. Respond — include invoice signal when fully paid ──────────────────
+    const isFullyPaid = resolvedStatus === "paid";
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        ...updatedPayment,
+        invoice_available:    isFullyPaid,
+        invoice_download_url: isFullyPaid
+          ? `/api/invoices/${payment.booking_id}/download`
+          : null,
+      },
+      error: null,
+    });
   } catch (err) {
-    return res.status(500).json({ success: false, data: null, error: err.message });
+    return res.status(500).json({
+      success: false,
+      data:    null,
+      error:   err.message,
+    });
   }
 };
 

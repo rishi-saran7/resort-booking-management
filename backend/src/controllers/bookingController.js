@@ -197,7 +197,12 @@ const createBooking = async (req, res) => {
       data: {
         booking,
         payment,
-        pricing_breakdown: pricing, // ← full breakdown returned to the client/UI
+        pricing_breakdown: pricing,
+        // ── Invoice signal for frontend ──────────────────────────────────
+        invoice_available:    payment.payment_status === "paid",
+        invoice_download_url: payment.payment_status === "paid"
+          ? `/api/invoices/${booking.id}/download`
+          : null,
       },
       error: null,
     });
@@ -464,17 +469,16 @@ const checkoutBooking = async (req, res) => {
       .eq("booking_id", id)
       .single();
 
-    let updatedPayment = null;
+    let updatedPayment = payment;
 
     if (!paymentFetchError && payment && payment.payment_status !== "paid") {
-      const { data: settledPayment, error: paymentUpdateError } = await supabase
+      const { data: settled } = await supabase
         .from("payments")
         .update({ payment_status: "paid", amount_paid: booking.total_amount })
         .eq("id", payment.id)
         .select()
         .single();
-
-      if (!paymentUpdateError) updatedPayment = settledPayment;
+      updatedPayment = settled;
     }
 
     logAudit({
@@ -482,7 +486,7 @@ const checkoutBooking = async (req, res) => {
       action:      "BOOKING_COMPLETED",
       entity_type: "booking",
       entity_id:   id,
-      metadata:    {
+      metadata: {
         previous_status:      booking.booking_status,
         new_status:           "completed",
         total_amount:         booking.total_amount,
@@ -492,7 +496,12 @@ const checkoutBooking = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      data: { booking: updatedBooking, payment: updatedPayment },
+      data: {
+        booking:              updatedBooking,
+        payment:              updatedPayment,
+        invoice_available:    true,                           // always true on checkout
+        invoice_download_url: `/api/invoices/${id}/download`,
+      },
       error: null,
     });
   } catch (err) {
